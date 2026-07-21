@@ -19,6 +19,18 @@ test("Renderer 注入脚本接受新版 Codex 的 29px 账户行", () => {
   assert.match(source, /rect\.height < MIN_ACCOUNT_ROW_HEIGHT_PX/);
 });
 
+test("Renderer 使用零延迟自绘 Tooltip 展示额度详情", () => {
+  const source = buildWidgetSource("test-revision");
+
+  // 修改人：liujl
+  // 修改时间：2026-07-21 15:10:12
+  // 修改说明：禁止回退到延迟不可控的原生 title，并锁定即时显示和减少动态效果规则。
+  assert.match(source, /badge\.dataset\.tooltip/);
+  assert.match(source, /transition-delay: 0s/);
+  assert.match(source, /prefers-reduced-motion: reduce/);
+  assert.doesNotMatch(source, /badge\.title\s*=/);
+});
+
 test("命令行默认使用 9341 和 60 秒刷新周期", () => {
   assert.deepEqual(parseArgs(["watch"]), {
     command: "watch",

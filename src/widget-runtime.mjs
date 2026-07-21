@@ -131,8 +131,15 @@ export function usageWidgetBootstrap(revision) {
     if (document.getElementById(STYLE_ID)) return;
     const style = document.createElement("style");
     style.id = STYLE_ID;
+    /*
+     * 修改人：liujl
+     * 修改时间：2026-07-21 15:10:12
+     * 修改说明：用零延迟的自绘 Tooltip 替代系统 title，缩短悬停等待时间；
+     * 同时保留短淡入并尊重减少动态效果设置，避免弹层突现和无障碍退化。
+     */
     style.textContent = `
       #${BADGE_ID} {
+        position: relative;
         display: inline-flex;
         flex: 0 0 auto;
         align-items: center;
@@ -152,10 +159,47 @@ export function usageWidgetBootstrap(revision) {
         pointer-events: auto;
         cursor: help;
       }
+      #${BADGE_ID}::after {
+        content: attr(data-tooltip);
+        position: absolute;
+        right: 0;
+        bottom: calc(100% + 8px);
+        z-index: 50;
+        width: max-content;
+        min-width: 180px;
+        max-width: min(280px, calc(100vw - 24px));
+        padding: 8px 10px;
+        border: 1px solid var(--color-token-border-default, rgba(230, 237, 243, 0.12));
+        border-radius: 8px;
+        background: var(--color-token-main-surface-primary, #202123);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+        color: var(--color-token-text-primary, #f4f4f5);
+        font-size: 12px;
+        font-weight: 400;
+        line-height: 1.5;
+        letter-spacing: normal;
+        text-align: left;
+        white-space: pre-line;
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+        transform: translateY(2px);
+        transition: opacity 80ms ease-out, transform 80ms ease-out, visibility 0s;
+        transition-delay: 0s;
+      }
+      #${BADGE_ID}:hover::after,
+      button:focus-visible #${BADGE_ID}::after {
+        opacity: 1;
+        visibility: visible;
+        transform: translateY(0);
+      }
       #${BADGE_ID}[data-level="healthy"] { color: #238636; border-color: color-mix(in srgb, #238636 35%, transparent); }
       #${BADGE_ID}[data-level="warning"] { color: #b76e00; border-color: color-mix(in srgb, #b76e00 38%, transparent); }
       #${BADGE_ID}[data-level="danger"] { color: var(--color-token-error-foreground, #d1242f); border-color: color-mix(in srgb, #d1242f 38%, transparent); }
       #${BADGE_ID}[data-level="unknown"] { opacity: .72; }
+      @media (prefers-reduced-motion: reduce) {
+        #${BADGE_ID}::after { transition: none; transform: none; }
+      }
     `;
     document.head.appendChild(style);
   };
@@ -194,10 +238,11 @@ export function usageWidgetBootstrap(revision) {
       badge.textContent =
         latestSnapshot.status === "loading" ? "用量…" : "用量 --";
       badge.dataset.level = "unknown";
-      badge.title =
+      badge.dataset.tooltip =
         latestSnapshot.status === "error"
           ? "暂时无法读取 Codex 用量"
           : "正在读取 Codex 用量";
+      badge.removeAttribute("title");
       return;
     }
 
@@ -214,7 +259,11 @@ export function usageWidgetBootstrap(revision) {
       if (!bucket.limitName || bucket.limitId === "codex") continue;
       lines.push(`${bucket.limitName}：剩余 ${bucket.remainingPercent}%`);
     }
-    badge.title = lines.join("\n");
+    // 修改人：liujl
+    // 修改时间：2026-07-21 15:10:12
+    // 修改说明：data-tooltip 由 CSS 即时渲染，移除 title 可避免延迟出现的系统提示与自绘提示重叠。
+    badge.dataset.tooltip = lines.join("\n");
+    badge.removeAttribute("title");
   };
 
   /**
