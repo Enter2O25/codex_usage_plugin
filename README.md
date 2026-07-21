@@ -74,3 +74,11 @@ npm run probe
 - Codex 更新如果改变侧栏 DOM 结构，结构评分可能找不到锚点；这种情况会停止挂载而不是猜测其他按钮。
 - 完全退出 Codex 后，如果后台注入器也被停止，下次启动需要再次运行启动命令。
 - CDP 端口只能绑定 `127.0.0.1`，不要改成局域网地址。
+
+## 参与贡献
+
+欢迎提交 Issue 和 Pull Request。开始开发前请阅读 [贡献指南](CONTRIBUTING.md)；发现安全问题时请按照 [安全策略](SECURITY.md) 私密报告，不要在公开 Issue 中发布认证信息或可被直接利用的细节。
+
+## 开源协议
+
+本项目采用 [MIT License](LICENSE)，Copyright (c) 2026 liujl。

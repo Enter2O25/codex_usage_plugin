@@ -1,0 +1,15 @@
+# macOS Finder 元数据
+.DS_Store
+
+# Node.js 依赖与测试覆盖率产物
+node_modules/
+coverage/
+
+# 本地环境配置和运行日志，不应进入开源仓库
+.env
+.env.*
+*.log
+
+# 常用编辑器的本地工作区配置
+.idea/
+.vscode/
