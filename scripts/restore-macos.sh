@@ -11,10 +11,10 @@ resolve_node
 if injector_pid="$(read_injector_pid 2>/dev/null)"; then
   /bin/kill -TERM "$injector_pid"
   deadline=$((SECONDS + 8))
-  while /bin/kill -0 "$injector_pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+  while injector_process_is_alive "$injector_pid" && [ "$SECONDS" -lt "$deadline" ]; do
     /bin/sleep 0.2
   done
-  /bin/kill -0 "$injector_pid" 2>/dev/null && fail "注入器未在超时内退出；未执行强制结束。"
+  injector_process_is_alive "$injector_pid" && fail "注入器未在超时内退出；未执行强制结束。"
 fi
 rm -f "$PID_FILE"
 

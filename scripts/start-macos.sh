@@ -11,9 +11,23 @@ resolve_node
 resolve_codex_bundle
 
 if existing_pid="$(read_injector_pid 2>/dev/null)"; then
-  print -- "Codex Usage Injector 已在运行，PID=$existing_pid"
-  "$NODE_BIN" "$CLI_PATH" status --port "$CDP_PORT" --json || true
-  exit 0
+  if cdp_is_ready; then
+    print -- "Codex Usage Injector 已在运行，PID=$existing_pid"
+    "$NODE_BIN" "$CLI_PATH" status --port "$CDP_PORT" --json || true
+    exit 0
+  fi
+
+  # Codex 重启后旧注入器可能仍在等待端口；此时不能直接退出，否则后续无法重新建立 CDP。
+  # 修改人：liujl
+  # 修改时间：2026-07-21 16:12:00
+  # 修改说明：识别“注入器存在但 CDP 已消失”的重启场景，优雅停止旧实例后继续启动流程。
+  print -- "检测到注入器正在等待 Codex CDP 端口，先停止旧实例（PID=$existing_pid）"
+  /bin/kill -TERM "$existing_pid"
+  deadline=$((SECONDS + 8))
+  while injector_process_is_alive "$existing_pid" && [ "$SECONDS" -lt "$deadline" ]; do
+    /bin/sleep 0.2
+  done
+  injector_process_is_alive "$existing_pid" && fail "旧注入器未在超时内退出；未执行强制结束，请手动运行恢复命令。"
 fi
 rm -f "$PID_FILE"
 

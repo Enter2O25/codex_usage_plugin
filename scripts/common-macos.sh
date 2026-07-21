@@ -74,13 +74,24 @@ codex_is_running() {
   [ "$(/usr/bin/osascript -e 'application id "com.openai.codex" is running' 2>/dev/null || print false)" = "true" ]
 }
 
+# 判断 PID 对应的进程是否仍然存在；僵尸进程不再视为可管理的注入器。
+# 作者：liujl
+# 创建时间：2026-07-21 16:12:00
+injector_process_is_alive() {
+  local pid="$1"
+  [[ "$pid" == <-> ]] || return 1
+  /bin/kill -0 "$pid" 2>/dev/null || return 1
+  local state
+  state="$(/bin/ps -p "$pid" -o state= 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$state" ] && [[ "$state" != Z* ]]
+}
+
 # 校验 PID 对应进程确实是本项目 watch 命令，禁止仅凭陈旧 PID 发送信号。
 # 作者：liujl
 # 创建时间：2026-07-21 13:47:34
 injector_pid_is_valid() {
   local pid="$1"
-  [[ "$pid" == <-> ]] || return 1
-  /bin/kill -0 "$pid" 2>/dev/null || return 1
+  injector_process_is_alive "$pid" || return 1
   local command_line
   command_line="$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)"
   [[ "$command_line" == *"$CLI_PATH"* ]] && [[ "$command_line" == *" watch"* ]]
