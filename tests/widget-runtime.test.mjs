@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { UsageInjector } from "../src/injector.mjs";
 import { buildWidgetSource } from "../src/widget-runtime.mjs";
 import { parseArgs } from "../src/cli.mjs";
 
@@ -29,6 +30,24 @@ test("Renderer 使用零延迟自绘 Tooltip 展示额度详情", () => {
   assert.match(source, /transition-delay: 0s/);
   assert.match(source, /prefers-reduced-motion: reduce/);
   assert.doesNotMatch(source, /badge\.title\s*=/);
+});
+
+test("停止注入器时立即关闭等待中的 app-server", () => {
+  const injector = new UsageInjector({ port: 9341, intervalMs: 60_000 });
+  let closed = false;
+  injector.appServer = {
+    close() {
+      closed = true;
+    },
+  };
+
+  // 修改人：liujl
+  // 修改时间：2026-07-22 17:45:00
+  // 修改说明：锁定更新恢复场景的快速停止行为，防止额度请求超时阻塞第二次启动。
+  injector.stop();
+  assert.equal(injector.stopping, true);
+  assert.equal(closed, true);
+  assert.equal(injector.appServer, null);
 });
 
 test("命令行默认使用 9341 和 60 秒刷新周期", () => {

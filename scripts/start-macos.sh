@@ -11,7 +11,8 @@ resolve_node
 resolve_codex_bundle
 
 if existing_pid="$(read_injector_pid 2>/dev/null)"; then
-  if cdp_is_ready; then
+  # 更新重启期间端口可能短暂可访问，但页面列表已经为空；必须以 Codex page target 为准。
+  if cdp_has_codex_page; then
     print -- "Codex Usage Injector 已在运行，PID=$existing_pid"
     "$NODE_BIN" "$CLI_PATH" status --port "$CDP_PORT" --json || true
     exit 0
@@ -21,7 +22,7 @@ if existing_pid="$(read_injector_pid 2>/dev/null)"; then
   # 修改人：liujl
   # 修改时间：2026-07-21 16:12:00
   # 修改说明：识别“注入器存在但 CDP 已消失”的重启场景，优雅停止旧实例后继续启动流程。
-  print -- "检测到注入器正在等待 Codex CDP 端口，先停止旧实例（PID=$existing_pid）"
+  print -- "检测到注入器正在等待 Codex 页面，先停止旧实例（PID=$existing_pid）"
   /bin/kill -TERM "$existing_pid"
   deadline=$((SECONDS + 8))
   while injector_process_is_alive "$existing_pid" && [ "$SECONDS" -lt "$deadline" ]; do

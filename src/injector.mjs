@@ -83,6 +83,11 @@ export class UsageInjector {
    */
   stop() {
     this.stopping = true;
+    // 修改人：liujl
+    // 修改时间：2026-07-22 17:45:00
+    // 修改说明：停止等待中的额度请求，避免 Codex 更新后旧注入器超过启动器等待窗口。
+    this.appServer?.close();
+    this.appServer = null;
   }
 
   /**

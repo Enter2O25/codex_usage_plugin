@@ -67,6 +67,24 @@ cdp_is_ready() {
   /usr/bin/curl --max-time 1 -fsS "http://127.0.0.1:$CDP_PORT/json/list" >/dev/null 2>&1
 }
 
+# 判断 CDP 不仅能响应，而且已经出现至少一个可注入的 Codex page target。
+# 仅能访问端口不代表 Renderer 已完成启动；更新重启时旧端口可能短暂保留但页面列表为空。
+# 作者：liujl
+# 创建时间：2026-07-22 17:40:00
+cdp_has_codex_page() {
+  local status_json
+  status_json="$("$NODE_BIN" "$CLI_PATH" status --port "$CDP_PORT" --json 2>/dev/null || true)"
+  [ -n "$status_json" ] || return 1
+  "$NODE_BIN" -e '
+    try {
+      const value = JSON.parse(process.argv[1]);
+      process.exit(Array.isArray(value.pages) && value.pages.length > 0 ? 0 : 1);
+    } catch {
+      process.exit(1);
+    }
+  ' "$status_json"
+}
+
 # 判断 Codex 主应用是否正在运行。
 # 作者：liujl
 # 创建时间：2026-07-21 13:47:34
