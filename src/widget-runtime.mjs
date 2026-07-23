@@ -385,11 +385,12 @@ export function usageWidgetBootstrap(revision) {
     return parts.length >= 3 ? parts.slice(0, -2).join(":") : null;
   };
 
-  /** 为当前会话的每条已完成助手回复追加对应 Token 统计。 */
+  /** 只为当前会话最新一条已完成助手回复追加 Token 统计，并清理历史回复上的旧节点。 */
   const ensureMessageUsage = () => {
     const conversationId = tokenUsageSnapshot?.conversationId;
-    const byTurnId = tokenUsageSnapshot?.byTurnId;
-    if (!conversationId || !byTurnId || typeof byTurnId !== "object") {
+    const latestTurnId = tokenUsageSnapshot?.latestTurnId;
+    const usage = tokenUsageSnapshot?.latest;
+    if (!conversationId || !latestTurnId || !usage) {
       document
         .querySelectorAll(`.${MESSAGE_USAGE_CLASS}`)
         .forEach((node) => node.remove());
@@ -408,10 +409,10 @@ export function usageWidgetBootstrap(revision) {
       )
         continue;
       const turnId = getMessageTurnId(message);
-      const usage = turnId ? byTurnId[turnId] : null;
-      const toolbar = usage ? findMessageToolbar(message) : null;
-      if (!turnId || !usage || !toolbar) continue;
-      mountedTurnIds.add(turnId);
+      if (turnId !== latestTurnId) continue;
+      const toolbar = findMessageToolbar(message);
+      if (!toolbar) continue;
+      mountedTurnIds.add(latestTurnId);
       const existing = message.querySelector(`.${MESSAGE_USAGE_CLASS}`);
       if (existing) {
         renderMessageUsage(existing, usage);

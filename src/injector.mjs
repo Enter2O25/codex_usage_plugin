@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { open, stat } from "node:fs/promises";
+import { StringDecoder } from "node:string_decoder";
 import { CodexAppServerClient } from "./app-server-client.mjs";
 import { connectCodexTarget, listCdpTargets } from "./cdp-client.mjs";
 import { logger } from "./logger.mjs";
@@ -24,8 +25,14 @@ const USAGE_RETRY_INTERVAL_MS = 10_000;
 /** 会话 Token 日志轮询间隔；比额度刷新更快，确保回复完成后尽快补到操作栏。 */
 const TOKEN_USAGE_POLL_INTERVAL_MS = 1_000;
 
-/** 会话日志单次读取的最小尾部保留长度，避免半行 JSON 被提前解析。 */
+/** 会话日志单行允许保留的最大长度；超长正文行直接跳过，避免把完整对话内容放进内存。 */
 const TOKEN_USAGE_LINE_BUFFER_LIMIT = 16_384;
+
+/**
+ * 会话日志增量读取块大小；固定上限避免首次处理大型 JSONL 时按文件大小分配 Buffer。
+ * 该值只影响单次磁盘读取，不改变日志偏移量和 Token 统计结果。
+ */
+const TOKEN_USAGE_READ_CHUNK_BYTES = 64 * 1024;
 
 /** 项目版本参与生成注入 revision，源码变化后旧 early script 会自动失效。 */
 const PROJECT_VERSION = "0.1.0";
@@ -387,7 +394,9 @@ export class UsageInjector {
         latestTurnId: null,
         currentTurnId: null,
         model: null,
-        byTurnId: new Map(),
+        decoder: new StringDecoder("utf8"),
+        skipOversizedLine: false,
+        oversizedLineWarned: false,
       };
       this.tokenLogStates.set(logPath, state);
     }
@@ -401,96 +410,144 @@ export class UsageInjector {
       state.latestTurnId = null;
       state.currentTurnId = null;
       state.model = null;
-      state.byTurnId.clear();
+      state.decoder = new StringDecoder("utf8");
+      state.skipOversizedLine = false;
+      state.oversizedLineWarned = false;
     }
+
+    /**
+     * 处理已经按换行切出的完整 JSONL 记录；不保存完整对话文本，只保留 Token 汇总状态。
+     * 作者：liujl
+     * 创建时间：2026-07-23 15:05:00
+     *
+     * @param {string[]} lines 完整行集合，不包含仍可能跨块的最后一行。
+     */
+    const consumeLines = (lines) => {
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let record;
+        try {
+          record = JSON.parse(line);
+        } catch {
+          // 只跳过当前损坏行；下一轮仍从完整行边界继续，不伪造 Token 结果。
+          continue;
+        }
+        const payload = record?.payload;
+        if (record?.type !== "event_msg" || !payload) continue;
+        if (payload.type === "task_started") {
+          const turnId = payload.turn_id;
+          state.currentTurnId =
+            typeof turnId === "string" && turnId ? turnId : null;
+          continue;
+        }
+        if (payload.type === "thread_settings_applied") {
+          const model = payload.thread_settings?.model;
+          if (typeof model === "string" && model) state.model = model;
+          continue;
+        }
+        if (payload.type !== "token_count") continue;
+        const usage = payload.info?.last_token_usage;
+        if (!usage || typeof usage !== "object") continue;
+        const fields = [
+          "input_tokens",
+          "output_tokens",
+          "total_tokens",
+          "cached_input_tokens",
+          "reasoning_output_tokens",
+        ];
+        if (
+          fields.some(
+            (field) =>
+              !Number.isInteger(usage[field]) || usage[field] < 0,
+          )
+        )
+          continue;
+        if (!state.currentTurnId) continue;
+        const usageSnapshot = {
+          inputTokens: usage.input_tokens,
+          outputTokens: usage.output_tokens,
+          totalTokens: usage.total_tokens,
+          cachedInputTokens: usage.cached_input_tokens,
+          reasoningOutputTokens: usage.reasoning_output_tokens,
+          model: state.model,
+          costLabel: "订阅额度",
+          updatedAtMs:
+            typeof record.timestamp === "string"
+              ? Date.parse(record.timestamp)
+              : Date.now(),
+        };
+        state.latestTurnId = state.currentTurnId;
+        state.latest = usageSnapshot;
+      }
+    };
+
+    /**
+     * 消费一个 UTF-8 文本块，只把完整且长度可控的 JSONL 行交给解析器。
+     * 超长行通常是正文或工具输出，不可能是需要展示的 Token 快照；丢弃到下一个换行符，
+     * 可以避免在等待行结束时持续增长字符串，同时保留后续正常记录的读取能力。
+     * 作者：liujl
+     * 创建时间：2026-07-23 15:08:00
+     *
+     * @param {string} text 当前读取块解码后的文本。
+     */
+    const consumeText = (text) => {
+      let start = 0;
+      while (start < text.length) {
+        const newlineIndex = text.indexOf("\n", start);
+        if (state.skipOversizedLine) {
+          if (newlineIndex < 0) return;
+          state.skipOversizedLine = false;
+          start = newlineIndex + 1;
+          continue;
+        }
+
+        const lineEnd = newlineIndex < 0 ? text.length : newlineIndex;
+        const line = `${state.remainder}${text.slice(start, lineEnd)}`;
+        state.remainder = "";
+        if (line.length > TOKEN_USAGE_LINE_BUFFER_LIMIT) {
+          state.skipOversizedLine = newlineIndex < 0;
+          if (!state.oversizedLineWarned) {
+            state.oversizedLineWarned = true;
+            logger.warn("会话日志存在超长正文记录，已跳过该行", {
+              logPath,
+              limitBytes: TOKEN_USAGE_LINE_BUFFER_LIMIT,
+            });
+          }
+        } else if (newlineIndex < 0) {
+          state.remainder = line;
+        } else {
+          consumeLines([line]);
+        }
+        if (newlineIndex < 0) return;
+        start = newlineIndex + 1;
+      }
+    };
 
     if (fileInfo.size > state.offset) {
       const handle = await open(logPath, "r");
+      const buffer = Buffer.allocUnsafe(TOKEN_USAGE_READ_CHUNK_BYTES);
       try {
-        const length = fileInfo.size - state.offset;
-        const buffer = Buffer.alloc(length);
-        await handle.read(buffer, 0, length, state.offset);
-        state.offset = fileInfo.size;
-        state.remainder = `${state.remainder}${buffer.toString("utf8")}`;
+        while (state.offset < fileInfo.size) {
+          const length = Math.min(
+            TOKEN_USAGE_READ_CHUNK_BYTES,
+            fileInfo.size - state.offset,
+          );
+          const result = await handle.read(buffer, 0, length, state.offset);
+          if (!result.bytesRead) break;
+          state.offset += result.bytesRead;
+          consumeText(
+            state.decoder.write(buffer.subarray(0, result.bytesRead)),
+          );
+        }
       } finally {
         await handle.close();
       }
-    }
-
-    const lines = state.remainder.split("\n");
-    state.remainder = lines.pop() ?? "";
-    if (state.remainder.length > TOKEN_USAGE_LINE_BUFFER_LIMIT) {
-      throw new Error("会话日志存在超过限制的未完成 JSON 行");
-    }
-
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let record;
-      try {
-        record = JSON.parse(line);
-      } catch {
-        // 只跳过当前损坏行；下一轮仍从完整行边界继续，不伪造 Token 结果。
-        continue;
-      }
-      const payload = record?.payload;
-      if (record?.type !== "event_msg" || !payload) continue;
-      if (payload.type === "task_started") {
-        const turnId = payload.turn_id;
-        state.currentTurnId =
-          typeof turnId === "string" && turnId ? turnId : null;
-        continue;
-      }
-      if (payload.type === "thread_settings_applied") {
-        const model = payload.thread_settings?.model;
-        if (typeof model === "string" && model) state.model = model;
-        continue;
-      }
-      if (payload.type !== "token_count") continue;
-      const usage = payload.info?.last_token_usage;
-      if (!usage || typeof usage !== "object") continue;
-      const fields = [
-        "input_tokens",
-        "output_tokens",
-        "total_tokens",
-        "cached_input_tokens",
-        "reasoning_output_tokens",
-      ];
-      if (
-        fields.some(
-          (field) =>
-            !Number.isInteger(usage[field]) || usage[field] < 0,
-        )
-      )
-        continue;
-      if (!state.currentTurnId) continue;
-      const usageSnapshot = {
-        inputTokens: usage.input_tokens,
-        outputTokens: usage.output_tokens,
-        totalTokens: usage.total_tokens,
-        cachedInputTokens: usage.cached_input_tokens,
-        reasoningOutputTokens: usage.reasoning_output_tokens,
-        model: state.model,
-        costLabel: "订阅额度",
-        updatedAtMs:
-          typeof record.timestamp === "string"
-            ? Date.parse(record.timestamp)
-            : Date.now(),
-      };
-      state.byTurnId.set(state.currentTurnId, usageSnapshot);
-      state.latestTurnId = state.currentTurnId;
-      state.latest = usageSnapshot;
     }
 
     if (!state.latest) return null;
     return {
       latest: { ...state.latest, model: state.model ?? state.latest.model },
       latestTurnId: state.latestTurnId,
-      byTurnId: Object.fromEntries(
-        [...state.byTurnId.entries()].map(([turnId, usage]) => [
-          turnId,
-          { ...usage, model: usage.model ?? state.model },
-        ]),
-      ),
     };
   }
 
@@ -513,7 +570,6 @@ export class UsageInjector {
             conversationId: context.conversationId,
             latest: usage.latest,
             latestTurnId: usage.latestTurnId,
-            byTurnId: usage.byTurnId,
           })}) ?? null`,
         );
       } catch (error) {
