@@ -305,20 +305,42 @@ export function usageWidgetBootstrap(revision) {
     return String(Math.round(value));
   };
 
-  /** 查找助手消息底部的操作栏，避免依赖编译后容易变化的完整 class 名。 */
+  /**
+   * 查找助手消息底部的操作栏，避免把统计误挂到正文代码块的复制栏。
+   * Codex 一条回复可能同时包含多个“复制”按钮；底部操作栏与时间节点位于同一个 h-5 行内，
+   * 因此先用时间节点定位该行，找不到时再按复制按钮从后往前尝试，不能退回到第一个复制按钮。
+   * 作者：liujl
+   * 创建时间：2026-07-23 14:45:00
+   * 修改人：liujl
+   * 修改时间：2026-07-23 14:45:00
+   * 修改说明：修复 Token 统计被挂到代码块标题栏的问题，确保追加到回复底部操作栏。
+   */
   const findMessageToolbar = (message) => {
-    const copyButton = message.querySelector('button[aria-label="复制"]');
-    if (!copyButton) return null;
-    let current = copyButton.parentElement;
+    const isToolbar = (element) =>
+      element.classList.contains("h-5") &&
+      element.classList.contains("items-center") &&
+      Boolean(element.querySelector('button[aria-label="复制"]'));
+
+    const timeNode = Array.from(
+      message.querySelectorAll("span.text-xs.text-token-text-tertiary"),
+    ).find((node) => /^\d{1,2}:\d{2}$/.test(node.textContent?.trim() ?? ""));
+    let current = timeNode?.parentElement ?? null;
     while (current && current !== message) {
-      if (
-        current.classList.contains("h-5") &&
-        current.classList.contains("items-center")
-      )
-        return current;
+      if (isToolbar(current)) return current;
       current = current.parentElement;
     }
-    return copyButton.parentElement;
+
+    const copyButtons = Array.from(
+      message.querySelectorAll('button[aria-label="复制"]'),
+    );
+    for (const copyButton of copyButtons.reverse()) {
+      current = copyButton.parentElement;
+      while (current && current !== message) {
+        if (isToolbar(current)) return current;
+        current = current.parentElement;
+      }
+    }
+    return null;
   };
 
   /**

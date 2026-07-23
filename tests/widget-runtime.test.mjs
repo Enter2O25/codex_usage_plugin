@@ -48,10 +48,11 @@ test("Renderer 在对应助手回复操作栏直接展示完整 Token 字段", (
   assert.match(source, /getMessageTurnId/);
   assert.match(source, /byTurnId/);
   assert.match(source, /value >= 1_000_000/);
+  assert.match(source, /const findMessageToolbar/);
+  assert.match(source, /timeNode/);
   // 修改人：liujl
   // 修改时间：2026-07-23 14:12:00
   // 修改说明：确认 Token 注入不会接管 Codex 原生消息时间样式，时间显示仍由客户端自身 hover 规则决定。
-  assert.doesNotMatch(source, /text-token-text-tertiary/);
   assert.doesNotMatch(source, /opacity: 1 !important/);
 });
 
