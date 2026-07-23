@@ -129,6 +129,22 @@ export class CodexAppServerClient extends EventEmitter {
   }
 
   /**
+   * 读取指定会话的持久化信息，用于定位 Codex 会话日志并关联 Renderer 中的当前回复。
+   *
+   * 作者：liujl
+   * 创建时间：2026-07-23 13:48:00
+   *
+   * @param {string} threadId Codex 会话标识。
+   * @returns {Promise<Record<string, unknown>>} thread/read 返回的会话信息。
+   * @throws {Error} 会话不存在或 app-server 返回协议错误时抛出异常。
+   */
+  async readThread(threadId) {
+    if (typeof threadId !== "string" || !threadId.trim())
+      throw new TypeError("threadId 必须是非空字符串");
+    return this.request("thread/read", { threadId, includeTurns: false });
+  }
+
+  /**
    * 发送 JSON-RPC 请求并等待相同 id 的响应。
    * 作者：liujl
    * 创建时间：2026-07-21 13:47:34

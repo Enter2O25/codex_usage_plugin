@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { open, stat } from "node:fs/promises";
 import { CodexAppServerClient } from "./app-server-client.mjs";
 import { connectCodexTarget, listCdpTargets } from "./cdp-client.mjs";
 import { logger } from "./logger.mjs";
@@ -19,6 +20,12 @@ const CONNECTION_LOG_INTERVAL_MS = 5_000;
 
 /** 数据读取失败后的重试间隔；失败时比正常刷新更快，但不高频请求后台。 */
 const USAGE_RETRY_INTERVAL_MS = 10_000;
+
+/** 会话 Token 日志轮询间隔；比额度刷新更快，确保回复完成后尽快补到操作栏。 */
+const TOKEN_USAGE_POLL_INTERVAL_MS = 1_000;
+
+/** 会话日志单次读取的最小尾部保留长度，避免半行 JSON 被提前解析。 */
+const TOKEN_USAGE_LINE_BUFFER_LIMIT = 16_384;
 
 /** 项目版本参与生成注入 revision，源码变化后旧 early script 会自动失效。 */
 const PROJECT_VERSION = "0.1.0";
@@ -72,6 +79,9 @@ export class UsageInjector {
     this.appServer = null;
     this.latestSnapshot = { status: "loading" };
     this.nextUsagePollAt = 0;
+    this.nextTokenUsagePollAt = 0;
+    this.threadLogPaths = new Map();
+    this.tokenLogStates = new Map();
     this.stopping = false;
     this.lastConnectionLogAt = 0;
   }
@@ -107,6 +117,8 @@ export class UsageInjector {
       while (!this.stopping) {
         await this.refreshTargets();
         if (Date.now() >= this.nextUsagePollAt) await this.pollUsage();
+        if (Date.now() >= this.nextTokenUsagePollAt)
+          await this.pollTokenUsage();
         await sleep(DISCOVERY_INTERVAL_MS);
       }
     } finally {
@@ -299,6 +311,221 @@ export class UsageInjector {
   }
 
   /**
+   * 读取当前 Renderer 正在展示的会话和最后一条助手回复锚点。
+   *
+   * Codex 当前页面会在助手消息容器上写入稳定的
+   * data-response-annotation-conversation/data-response-annotation-target 属性；
+   * 通过这两个属性关联会话日志，不依赖易变的 CSS module 类名。
+   * 作者：liujl
+   * 创建时间：2026-07-23 13:48:00
+   *
+   * @param {import("./cdp-client.mjs").CdpSession} session Renderer 会话。
+   * @returns {Promise<{conversationId: string, messageTarget: string} | null>} 当前会话上下文。
+   */
+  async readRendererConversation(session) {
+    return session.evaluate(`(() => {
+      const nodes = Array.from(document.querySelectorAll(
+        '[data-response-annotation-conversation][data-response-annotation-target]'
+      ));
+      const visible = nodes.filter((node) => {
+        const rect = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+      });
+      // 只有出现“复制”按钮的助手消息才视为已完成；流式输出阶段不提前把上一条回复误绑定到新 usage。
+      const completed = visible.filter((node) =>
+        node.querySelector('button[aria-label="复制"]'),
+      );
+      const current = completed.at(-1);
+      if (!current) return null;
+      const conversationId = current.getAttribute('data-response-annotation-conversation');
+      const messageTarget = current.getAttribute('data-response-annotation-target');
+      if (!conversationId || !messageTarget) return null;
+      return { conversationId, messageTarget };
+    })()`);
+  }
+
+  /**
+   * 按会话标识定位 Codex 持久化日志路径；路径只缓存，不缓存日志内容，避免更新后读到旧快照。
+   * 作者：liujl
+   * 创建时间：2026-07-23 13:48:00
+   *
+   * @param {string} conversationId 会话标识。
+   * @returns {Promise<string>} 会话 JSONL 日志绝对路径。
+   */
+  async resolveThreadLogPath(conversationId) {
+    const cached = this.threadLogPaths.get(conversationId);
+    if (cached) return cached;
+    const client = await this.ensureAppServer();
+    const response = await client.readThread(conversationId);
+    const thread = response?.thread;
+    if (!thread || typeof thread.path !== "string" || !thread.path)
+      throw new Error(`会话 ${conversationId} 缺少可读取的日志路径`);
+    this.threadLogPaths.set(conversationId, thread.path);
+    return thread.path;
+  }
+
+  /**
+   * 增量读取会话 JSONL 尾部，并提取最近一次 turn 的 Token 统计和模型。
+   *
+   * session 日志中的 token_count 是 Codex 当前 turn 的 usage 快照；按 task_started 的 turn_id
+   * 聚合后，可将历史统计绑定到页面对应助手回复，避免把中间流式快照误当作多个回复。日志只在本机读取，
+   * 不把 Cookie、Access Token 或完整对话内容传入 Renderer。
+   * 作者：liujl
+   * 创建时间：2026-07-23 13:48:00
+   *
+   * @param {string} logPath 会话 JSONL 日志路径。
+   * @returns {Promise<Record<string, unknown> | null>} 按 turnId 聚合的 Token 统计，没有统计时返回 null。
+   */
+  async readTokenUsageFromLog(logPath) {
+    let state = this.tokenLogStates.get(logPath);
+    if (!state) {
+      state = {
+        offset: 0,
+        remainder: "",
+        latest: null,
+        latestTurnId: null,
+        currentTurnId: null,
+        model: null,
+        byTurnId: new Map(),
+      };
+      this.tokenLogStates.set(logPath, state);
+    }
+
+    const fileInfo = await stat(logPath);
+    if (fileInfo.size < state.offset) {
+      // Codex 更新或会话归档可能替换日志文件；文件缩短时必须从头读取，不能沿用旧偏移量。
+      state.offset = 0;
+      state.remainder = "";
+      state.latest = null;
+      state.latestTurnId = null;
+      state.currentTurnId = null;
+      state.model = null;
+      state.byTurnId.clear();
+    }
+
+    if (fileInfo.size > state.offset) {
+      const handle = await open(logPath, "r");
+      try {
+        const length = fileInfo.size - state.offset;
+        const buffer = Buffer.alloc(length);
+        await handle.read(buffer, 0, length, state.offset);
+        state.offset = fileInfo.size;
+        state.remainder = `${state.remainder}${buffer.toString("utf8")}`;
+      } finally {
+        await handle.close();
+      }
+    }
+
+    const lines = state.remainder.split("\n");
+    state.remainder = lines.pop() ?? "";
+    if (state.remainder.length > TOKEN_USAGE_LINE_BUFFER_LIMIT) {
+      throw new Error("会话日志存在超过限制的未完成 JSON 行");
+    }
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        // 只跳过当前损坏行；下一轮仍从完整行边界继续，不伪造 Token 结果。
+        continue;
+      }
+      const payload = record?.payload;
+      if (record?.type !== "event_msg" || !payload) continue;
+      if (payload.type === "task_started") {
+        const turnId = payload.turn_id;
+        state.currentTurnId =
+          typeof turnId === "string" && turnId ? turnId : null;
+        continue;
+      }
+      if (payload.type === "thread_settings_applied") {
+        const model = payload.thread_settings?.model;
+        if (typeof model === "string" && model) state.model = model;
+        continue;
+      }
+      if (payload.type !== "token_count") continue;
+      const usage = payload.info?.last_token_usage;
+      if (!usage || typeof usage !== "object") continue;
+      const fields = [
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cached_input_tokens",
+        "reasoning_output_tokens",
+      ];
+      if (
+        fields.some(
+          (field) =>
+            !Number.isInteger(usage[field]) || usage[field] < 0,
+        )
+      )
+        continue;
+      if (!state.currentTurnId) continue;
+      const usageSnapshot = {
+        inputTokens: usage.input_tokens,
+        outputTokens: usage.output_tokens,
+        totalTokens: usage.total_tokens,
+        cachedInputTokens: usage.cached_input_tokens,
+        reasoningOutputTokens: usage.reasoning_output_tokens,
+        model: state.model,
+        costLabel: "订阅额度",
+        updatedAtMs:
+          typeof record.timestamp === "string"
+            ? Date.parse(record.timestamp)
+            : Date.now(),
+      };
+      state.byTurnId.set(state.currentTurnId, usageSnapshot);
+      state.latestTurnId = state.currentTurnId;
+      state.latest = usageSnapshot;
+    }
+
+    if (!state.latest) return null;
+    return {
+      latest: { ...state.latest, model: state.model ?? state.latest.model },
+      latestTurnId: state.latestTurnId,
+      byTurnId: Object.fromEntries(
+        [...state.byTurnId.entries()].map(([turnId, usage]) => [
+          turnId,
+          { ...usage, model: usage.model ?? state.model },
+        ]),
+      ),
+    };
+  }
+
+  /**
+   * 把当前会话最近一次 Token 统计推送到对应助手回复底部；读取失败只影响 Token 展示，不覆盖额度徽标。
+   * 作者：liujl
+   * 创建时间：2026-07-23 13:48:00
+   */
+  async pollTokenUsage() {
+    this.nextTokenUsagePollAt = Date.now() + TOKEN_USAGE_POLL_INTERVAL_MS;
+    for (const [targetId, record] of this.sessions) {
+      try {
+        const context = await this.readRendererConversation(record.session);
+        if (!context) continue;
+        const logPath = await this.resolveThreadLogPath(context.conversationId);
+        const usage = await this.readTokenUsageFromLog(logPath);
+        if (!usage) continue;
+        await record.session.evaluate(
+          `window[${JSON.stringify(WIDGET_STATE_KEY)}]?.updateTokenUsage?.(${JSON.stringify({
+            conversationId: context.conversationId,
+            latest: usage.latest,
+            latestTurnId: usage.latestTurnId,
+            byTurnId: usage.byTurnId,
+          })}) ?? null`,
+        );
+      } catch (error) {
+        logger.warn("读取当前对话 Token 用量失败", {
+          targetId,
+          error: error.message,
+        });
+      }
+    }
+  }
+
+  /**
    * 注销 early script、移除当前 DOM 组件并关闭外部进程。
    * 作者：liujl
    * 创建时间：2026-07-21 13:47:34
@@ -327,6 +554,8 @@ export class UsageInjector {
       record.session.close();
     }
     this.sessions.clear();
+    this.threadLogPaths.clear();
+    this.tokenLogStates.clear();
     this.appServer?.close();
     this.appServer = null;
   }

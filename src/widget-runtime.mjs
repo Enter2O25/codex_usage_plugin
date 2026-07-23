@@ -14,6 +14,8 @@ export function usageWidgetBootstrap(revision) {
   const BADGE_ID = "codex-usage-badge";
   /** 样式节点 id，恢复时只删除本项目拥有的规则。 */
   const STYLE_ID = "codex-usage-style";
+  /** 回复操作栏中的 Token 统计节点 class，允许 React 重渲染后精确清理自有节点。 */
+  const MESSAGE_USAGE_CLASS = "codex-usage-message-token-stats";
   /** 侧栏底部候选区域高度；账户行位于侧栏底部，超出该区域的按钮不得成为锚点。 */
   const FOOTER_ZONE_PX = 190;
   /**
@@ -36,6 +38,7 @@ export function usageWidgetBootstrap(revision) {
   let timer = null;
   let scheduled = false;
   let latestSnapshot = { status: "loading" };
+  let tokenUsageSnapshot = null;
   let lastAnchorScore = null;
 
   /**
@@ -137,6 +140,11 @@ export function usageWidgetBootstrap(revision) {
      * 修改说明：用零延迟的自绘 Tooltip 替代系统 title，缩短悬停等待时间；
      * 同时保留短淡入并尊重减少动态效果设置，避免弹层突现和无障碍退化。
      */
+    /*
+     * 修改人：liujl
+     * 修改时间：2026-07-23 14:12:00
+     * 修改说明：移除对 Codex 原生消息时间透明度的覆盖，恢复时间自身的 hover 显示样式。
+     */
     style.textContent = `
       #${BADGE_ID} {
         position: relative;
@@ -199,6 +207,19 @@ export function usageWidgetBootstrap(revision) {
       #${BADGE_ID}[data-level="unknown"] { opacity: .72; }
       @media (prefers-reduced-motion: reduce) {
         #${BADGE_ID}::after { transition: none; transform: none; }
+      }
+      .${MESSAGE_USAGE_CLASS} {
+        display: inline-flex;
+        flex: 0 1 auto;
+        align-items: center;
+        min-width: 0;
+        margin-left: 8px;
+        color: var(--color-token-text-tertiary, #8e8ea0);
+        font-size: 10px;
+        font-weight: 400;
+        line-height: 1.35;
+        white-space: normal;
+        overflow-wrap: anywhere;
       }
     `;
     document.head.appendChild(style);
@@ -267,6 +288,126 @@ export function usageWidgetBootstrap(revision) {
   };
 
   /**
+   * 将 Token 数量压缩为可直接放在回复操作栏中的 K/M 形式。
+   * Token 本身仍是计量单位，K/M 只是千和百万的数量缩写；小于 1000 时保留原始整数。
+   * 作者：liujl
+   * 创建时间：2026-07-23 13:48:00
+   *
+   * @param {unknown} value Token 数量。
+   * @returns {string} 适合界面展示的数量文本。
+   */
+  const formatTokenCount = (value) => {
+    if (!Number.isFinite(value) || value < 0) return "--";
+    if (value >= 1_000_000)
+      return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 2).replace(/\.0+$|(?<=\.\d)0+$/, "")}M`;
+    if (value >= 1_000)
+      return `${(value / 1_000).toFixed(value >= 100_000 ? 0 : 1).replace(/\.0$/, "")}K`;
+    return String(Math.round(value));
+  };
+
+  /** 查找助手消息底部的操作栏，避免依赖编译后容易变化的完整 class 名。 */
+  const findMessageToolbar = (message) => {
+    const copyButton = message.querySelector('button[aria-label="复制"]');
+    if (!copyButton) return null;
+    let current = copyButton.parentElement;
+    while (current && current !== message) {
+      if (
+        current.classList.contains("h-5") &&
+        current.classList.contains("items-center")
+      )
+        return current;
+      current = current.parentElement;
+    }
+    return copyButton.parentElement;
+  };
+
+  /**
+   * 把最近一次完成的会话 Token 统计固定显示在对应助手回复操作栏后面。
+   * 作者：liujl
+   * 创建时间：2026-07-23 13:48:00
+   *
+   * @param {HTMLElement} messageUsage 展示节点。
+   * @param {Record<string, unknown>} usage 当前 turn 的 Token 统计。
+   */
+  const renderMessageUsage = (messageUsage, usage) => {
+    if (!usage) {
+      messageUsage.textContent = "本次用量读取中";
+      messageUsage.dataset.status = "loading";
+      return;
+    }
+    const model =
+      typeof usage.model === "string" && usage.model
+        ? usage.model
+        : "未知模型";
+    const cost =
+      typeof usage.costLabel === "string" && usage.costLabel
+        ? usage.costLabel
+        : "无法换算";
+    messageUsage.textContent = [
+      `输入 ${formatTokenCount(usage.inputTokens)} tokens`,
+      `输出 ${formatTokenCount(usage.outputTokens)} tokens`,
+      `合计 ${formatTokenCount(usage.totalTokens)} tokens`,
+      `模型 ${model}`,
+      `费用 ${cost}`,
+    ].join(" · ");
+    messageUsage.dataset.status = "ready";
+  };
+
+  /** 从页面稳定的内容搜索键中提取 turnId，用于关联本地日志中的同一轮对话。 */
+  const getMessageTurnId = (message) => {
+    const unit = message.closest("[data-content-search-unit-key]");
+    const key = unit?.getAttribute("data-content-search-unit-key");
+    if (typeof key !== "string") return null;
+    const parts = key.split(":");
+    // Codex 当前格式为 `${turnId}:${itemIndex}:assistant`，只取前缀 turnId，不能把 itemIndex 一并带入匹配键。
+    return parts.length >= 3 ? parts.slice(0, -2).join(":") : null;
+  };
+
+  /** 为当前会话的每条已完成助手回复追加对应 Token 统计。 */
+  const ensureMessageUsage = () => {
+    const conversationId = tokenUsageSnapshot?.conversationId;
+    const byTurnId = tokenUsageSnapshot?.byTurnId;
+    if (!conversationId || !byTurnId || typeof byTurnId !== "object") {
+      document
+        .querySelectorAll(`.${MESSAGE_USAGE_CLASS}`)
+        .forEach((node) => node.remove());
+      return;
+    }
+    const messages = Array.from(
+      document.querySelectorAll(
+        '[data-response-annotation-conversation][data-response-annotation-target]',
+      ),
+    );
+    const mountedTurnIds = new Set();
+    for (const message of messages) {
+      if (
+        message.getAttribute("data-response-annotation-conversation") !==
+        conversationId
+      )
+        continue;
+      const turnId = getMessageTurnId(message);
+      const usage = turnId ? byTurnId[turnId] : null;
+      const toolbar = usage ? findMessageToolbar(message) : null;
+      if (!turnId || !usage || !toolbar) continue;
+      mountedTurnIds.add(turnId);
+      const existing = message.querySelector(`.${MESSAGE_USAGE_CLASS}`);
+      if (existing) {
+        renderMessageUsage(existing, usage);
+        continue;
+      }
+      const messageUsage = document.createElement("span");
+      messageUsage.className = MESSAGE_USAGE_CLASS;
+      messageUsage.dataset.turnId = turnId;
+      messageUsage.setAttribute("aria-label", "本次回复 Token 用量");
+      renderMessageUsage(messageUsage, usage);
+      toolbar.appendChild(messageUsage);
+    }
+    document.querySelectorAll(`.${MESSAGE_USAGE_CLASS}`).forEach((node) => {
+      if (!mountedTurnIds.has(node.dataset.turnId)) node.remove();
+    });
+  };
+
+  /**
    * 确认锚点和徽标存在；React 重建侧栏后会在新账户按钮上重新挂载。
    * 作者：liujl
    * 创建时间：2026-07-21 13:47:34
@@ -274,6 +415,8 @@ export function usageWidgetBootstrap(revision) {
   const ensure = () => {
     if (localStorage.getItem(ACTIVE_REVISION_KEY) !== revision) return;
     ensureStyle();
+    // 回复用量与侧栏账户行是两个独立挂载点；即使客户端改版暂时找不到账户行，也不能丢失已获取的回复统计。
+    ensureMessageUsage();
     const anchor = findAnchor();
     if (!anchor) {
       document.getElementById(BADGE_ID)?.remove();
@@ -317,6 +460,9 @@ export function usageWidgetBootstrap(revision) {
     observer?.disconnect();
     if (timer) clearInterval(timer);
     document.getElementById(BADGE_ID)?.remove();
+    document
+      .querySelectorAll(`.${MESSAGE_USAGE_CLASS}`)
+      .forEach((node) => node.remove());
     document.getElementById(STYLE_ID)?.remove();
     if (!options.preserveRevision) localStorage.removeItem(ACTIVE_REVISION_KEY);
     if (window[STATE_KEY]?.revision === revision) delete window[STATE_KEY];
@@ -343,6 +489,18 @@ export function usageWidgetBootstrap(revision) {
       return this.status();
     },
     /**
+     * 接收宿主从当前会话 JSONL 日志解析出的最近一条回复 Token 统计。
+     * 作者：liujl
+     * 创建时间：2026-07-23 13:48:00
+     */
+    updateTokenUsage(snapshot) {
+      if (!snapshot || typeof snapshot !== "object")
+        throw new TypeError("Token 用量更新必须是对象");
+      tokenUsageSnapshot = snapshot;
+      ensure();
+      return this.status();
+    },
+    /**
      * 返回当前挂载和数据状态，供状态命令做真实 DOM 验证。
      * 作者：liujl
      * 创建时间：2026-07-21 13:47:34
@@ -352,6 +510,9 @@ export function usageWidgetBootstrap(revision) {
         active: true,
         revision,
         mounted: Boolean(document.getElementById(BADGE_ID)),
+        messageUsageMounted: Boolean(
+          document.querySelector(`.${MESSAGE_USAGE_CLASS}`),
+        ),
         anchorScore: lastAnchorScore,
         snapshotStatus: latestSnapshot.status,
       };
